@@ -1,0 +1,1252 @@
+OS ASSIGNMENT 2 - TASK CODE COLLECTION
+
+Contents
+  1. sleep.c
+  2. sixfive.c
+  3. memdump.c
+  4. find.c (including -exec)
+  5. secret.c (supplied companion program)
+  6. attack.c
+  7. sandbox.c / interpose syscall
+     - File-change order
+     - Relevant kernel code and user interface additions
+     - Complete sandbox.c and sbtest.c
+     - Runtime function flow and test commands
+  8. Makefile entries and build commands
+
+The first six listings are the reference versions used in your earlier revision
+guide. sixfive.c intentionally omits numeric overflow checking: its input values
+must fit in a signed 32-bit int. The sandbox listings come from your completed
+WSL assignment checkout. They are not the intentionally incomplete or buggy
+questions in Midterm_Practice.
+
+Each user .c listing is a separate file, not a piece of one combined C program.
+Sandbox kernel sections are explicitly marked as additions, complete functions,
+or a complete file. Keep the other existing kernel code when applying additions.
+These are xv6/RISC-V programs; they are built in the xv6 tree, not with Windows
+GCC or the ordinary-C Makefile_Practice project.
+
+This xv6 version exposes pause(ticks), rather than sleep(ticks), to user code.
+Its kernel fork implementation is named kfork().
+
+
+==============================================================================
+sleep.c
+==============================================================================
+File: user/sleep.c
+Task: validate the tick count, call pause(ticks), and exit.
+
+#include "kernel/types.h"
+#include "user/user.h"
+
+int
+main(int argc, char *argv[])
+{
+  if (argc != 2 || argv[1][0] == '\0') {
+    fprintf(2, "Usage: sleep ticks\n");
+    exit(1);
+  }
+
+  for (int i = 0; argv[1][i] != '\0'; i++) {
+    if (argv[1][i] < '0' || argv[1][i] > '9') {
+      fprintf(2, "sleep: invalid number of ticks\n");
+      exit(1);
+    }
+  }
+
+  char *number = argv[1];
+  while (*number == '0')
+    number++;
+  if (strlen(number) > 10 ||
+      (strlen(number) == 10 && strcmp(number, "2147483647") > 0)) {
+    fprintf(2, "sleep: tick count is too large\n");
+    exit(1);
+  }
+
+  int ticks = atoi(number);
+  if (pause(ticks) < 0) {
+    fprintf(2, "sleep: pause failed\n");
+    exit(1);
+  }
+  exit(0);
+}
+
+
+==============================================================================
+sixfive.c
+==============================================================================
+File: user/sixfive.c
+Task: read stdin or files and print valid numeric tokens divisible by 5 OR 6.
+Numbers divisible by both are included. Finish a pending token at EOF.
+
+#include "kernel/types.h"
+#include "kernel/fcntl.h"
+#include "user/user.h"
+
+int
+sixfive(int fd)
+{
+  int number = 0;
+  int has_digits = 0;
+  int valid = 1;
+  char c;
+
+  while (1) {
+    int n = read(fd, &c, 1);
+    if (n < 0) {
+      fprintf(2, "sixfive: read failed\n");
+      return -1;
+    }
+
+    if (n == 0 || strchr(" -\r\t\n./,", c) != 0) {
+      if (has_digits && valid) {
+        if (number % 5 == 0 || number % 6 == 0)
+          printf("%d\n", number);
+      }
+      number = 0;
+      has_digits = 0;
+      valid = 1;
+      if (n == 0)
+        break;
+    } else if (c >= '0' && c <= '9') {
+      has_digits = 1;
+      if (valid) {
+        int digit = c - '0';
+        number = number * 10 + digit;
+      }
+    } else {
+      valid = 0;
+    }
+  }
+  return 0;
+}
+
+int
+main(int argc, char *argv[])
+{
+  if (argc == 1)
+    exit(sixfive(0) < 0);
+
+  int failed = 0;
+  for (int i = 1; i < argc; i++) {
+    int fd = open(argv[i], O_RDONLY);
+    if (fd < 0) {
+      fprintf(2, "sixfive: cannot open %s\n", argv[i]);
+      failed = 1;
+      continue;
+    }
+    if (sixfive(fd) < 0)
+      failed = 1;
+    if (close(fd) < 0) {
+      fprintf(2, "sixfive: close failed\n");
+      failed = 1;
+    }
+  }
+  exit(failed);
+}
+
+
+==============================================================================
+memdump.c
+==============================================================================
+File: user/memdump.c
+Task: interpret memory using the format characters i, p, h, c, s, S.
+This is the original assignment contract: s follows a stored string pointer;
+S prints the remaining inline string and ends this dump. It differs from the
+unpack practice question. main() includes the supplied examples and stdin mode.
+
+#include "kernel/types.h"
+#include "user/user.h"
+#include "kernel/fcntl.h"
+
+void memdump(char *fmt, char *data, int len);
+
+int
+main(int argc, char *argv[])
+{
+  if (argc == 1) {
+    printf("Example 1:\n");
+    int a[2] = {61810, 2026};
+    memdump("ii", (char *)a, sizeof(a));
+
+    printf("Example 2:\n");
+    memdump("S", "a string", sizeof("a string"));
+
+    printf("Example 3:\n");
+    char *s = "another";
+    memdump("s", (char *)&s, sizeof(s));
+
+    struct sss {
+      char *ptr;
+      int num1;
+      short num2;
+      char byte;
+      char bytes[8];
+    } example;
+
+    example.ptr = "hello";
+    example.num1 = 1819438967;
+    example.num2 = 100;
+    example.byte = 'z';
+    strcpy(example.bytes, "xyzzy");
+
+    printf("Example 4:\n");
+    memdump("pihcS", (char *)&example, sizeof(example));
+
+    printf("Example 5:\n");
+    memdump("sccccc", (char *)&example, sizeof(example));
+  } else if (argc == 2) {
+    // format in argv[1], up to 512 bytes of data from standard input.
+    char data[512];
+    int n = 0;
+    memset(data, '\0', sizeof(data));
+    while (n < sizeof(data)) {
+      int nn = read(0, data + n, sizeof(data) - n);
+      if (nn <= 0)
+        break;
+      n += nn;
+    }
+    memdump(argv[1], data, n);
+  } else {
+    printf("Usage: memdump [format]\n");
+    exit(1);
+  }
+  exit(0);
+}
+
+void
+memdump(char *fmt, char *data, int len)
+{
+  for (int j = 0; fmt[j] != '\0'; j++) {
+    char format = fmt[j];
+    if (format == 'S') {
+      while (len > 0 && *data != '\0') {
+        printf("%c", *data);
+        data++;
+        len--;
+      }
+      printf("\n");
+      return;
+    }
+    int required;
+
+    if (format == 'i') {
+      required = 4;
+    } else if (format == 'p' || format == 's') {
+      required = 8;
+    } else if (format == 'h') {
+      required = 2;
+    } else if (format == 'c') {
+      required = 1;
+    } else {
+      printf("memdump: unsupported format '%c'\n", format);
+      return;
+    }
+    if (len < required) {
+      printf("memdump: not enough data for '%c'\n", format);
+      return;
+    }
+    if (format == 'i') {
+      int value;
+      memmove(&value, data, required);
+      printf("%d\n", value);
+    } else if (format == 'p') {
+      uint64 value;
+      memmove(&value, data, required);
+      printf("%lx\n", value);
+    } else if (format == 'h') {
+      short value;
+      memmove(&value, data, required);
+      printf("%d\n", (int)value);
+    } else if (format == 'c') {
+      printf("%c\n", *data);
+    } else if (format == 's') {
+      char *string;
+      memmove(&string, data, required);
+      printf("%s\n", string);
+    }
+
+    data += required;
+    len -= required;
+  }
+}
+
+
+==============================================================================
+find.c
+==============================================================================
+File: user/find.c
+Task: recursively find matching names. With -exec, append the matching path
+to the supplied command arguments, fork, exec the command, and wait.
+
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "kernel/fs.h"
+#include "kernel/fcntl.h"
+#include "kernel/param.h"
+#include "user/user.h"
+
+char *
+filename(char *path)
+{
+  char *name = path;
+  for (char *p = path; *p != '\0'; p++) {
+    if (*p == '/')
+      name = p + 1;
+  }
+  return name;
+}
+
+int
+match(char *path, char **command, int count)
+{
+  if (count == 0) {
+    printf("%s\n", path);
+    return 0;
+  }
+
+  char *args[MAXARG];
+  for (int i = 0; i < count; i++)
+    args[i] = command[i];
+  args[count] = path;
+  args[count + 1] = 0;
+
+  int pid = fork();
+  if (pid < 0) {
+    fprintf(2, "find: fork failed\n");
+    return 1;
+  }
+  if (pid == 0) {
+    exec(args[0], args);
+    fprintf(2, "find: cannot exec %s\n", args[0]);
+    exit(1);
+  }
+
+  int status;
+  if (wait(&status) != pid) {
+    fprintf(2, "find: wait failed\n");
+    return 1;
+  }
+  return status != 0;
+}
+
+int
+find(char *path, char *target, char **command, int count)
+{
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    fprintf(2, "find: cannot open %s\n", path);
+    return 1;
+  }
+
+  struct stat st;
+  if (fstat(fd, &st) < 0) {
+    fprintf(2, "find: cannot stat %s\n", path);
+    close(fd);
+    return 1;
+  }
+
+  int failed = 0;
+  if (strcmp(filename(path), target) == 0)
+    failed = match(path, command, count);
+
+  if (st.type == T_DIR) {
+    char buf[512];
+    struct dirent de;
+    if (strlen(path) + 1 + DIRSIZ + 1 > sizeof(buf)) {
+      fprintf(2, "find: path too long: %s\n", path);
+      close(fd);
+      return 1;
+    }
+
+    strcpy(buf, path);
+    char *p = buf + strlen(buf);
+    if (p == buf || p[-1] != '/')
+      *p++ = '/';
+
+    int n;
+    while ((n = read(fd, &de, sizeof(de))) == sizeof(de)) {
+      if (de.inum == 0)
+        continue;
+      memmove(p, de.name, DIRSIZ);
+      p[DIRSIZ] = '\0';
+      if (strcmp(p, ".") == 0 || strcmp(p, "..") == 0)
+        continue;
+      if (find(buf, target, command, count) != 0)
+        failed = 1;
+    }
+    if (n != 0) {
+      fprintf(2, "find: cannot read directory %s\n", path);
+      failed = 1;
+    }
+  }
+
+  if (close(fd) < 0) {
+    fprintf(2, "find: cannot close %s\n", path);
+    failed = 1;
+  }
+  return failed;
+}
+
+int
+main(int argc, char *argv[])
+{
+  if (argc < 3 || (argc > 3 &&
+      (argc < 5 || strcmp(argv[3], "-exec") != 0))) {
+    fprintf(2, "Usage: find path name [-exec command [args...]]\n");
+    exit(1);
+  }
+
+  int count = argc > 3 ? argc - 4 : 0;
+  if (count > MAXARG - 2) {
+    fprintf(2, "find: too many command arguments\n");
+    exit(1);
+  }
+
+  char *path = argv[1];
+  int length = strlen(path);
+  while (length > 1 && path[length - 1] == '/')
+    path[--length] = '\0';
+
+  exit(find(path, argv[2], count ? &argv[4] : 0, count));
+}
+
+
+==============================================================================
+secret.c
+==============================================================================
+File: user/secret.c
+Supplied companion for attack.c: leave a marker and secret in allocated memory,
+then exit. It is included unchanged for understanding the memory-reuse task.
+
+#include "kernel/types.h"
+#include "kernel/fcntl.h"
+#include "user/user.h"
+#include "kernel/riscv.h"
+
+#define DATASIZE (9 * 4096)
+
+int
+main(int argc, char *argv[])
+{
+  if (argc != 2) {
+    printf("Usage: secret the-secret\n");
+    exit(1);
+  }
+
+  char *data = sbrk(DATASIZE);
+
+  // avoid putting the secret near the very start of a page.
+  unsigned long align = ((unsigned long) data) % 4096;
+  if(align != 0)
+    data += (4096 - align);
+
+  // but put it at a random-ish offset.
+  if(strlen(argv[1]) > 0)
+    data += 32 + (unsigned int)(argv[1][0] & 0xff);
+
+#define MSG "Here it is: "
+  strcpy(data, MSG);
+  strcpy(data + strlen(MSG), argv[1]);
+
+  exit(0);
+}
+
+
+==============================================================================
+attack.c
+==============================================================================
+File: user/attack.c
+Task: allocate memory, scan for the marker left by secret.c, validate a
+NUL-terminated alphanumeric secret, and print it. This depends on the deliberately
+vulnerable LAB_SYSCALL allocator supplied with this lab: freed/new pages are not
+overwritten/zeroed in the relevant paths. Ordinary zeroed allocations will not
+retain the old secret. No allocator edits are needed for the sandbox task.
+
+#include "kernel/types.h"
+#include "user/user.h"
+
+int
+main(int argc, char *argv[])
+{
+  int size = 32 * 4096;
+  char *data = sbrk(size);
+  if (data == SBRK_ERROR) {
+    fprintf(2, "attack: allocation failed\n");
+    exit(1);
+  }
+
+  char *marker = "Here it is: ";
+  int length = strlen(marker);
+  for (int i = 0; i + length < size; i++) {
+    if (memcmp(data + i, marker, length) != 0)
+      continue;
+    int start = i + length;
+    int end = start;
+    while (end < size &&
+           ((data[end] >= '0' && data[end] <= '9') ||
+            (data[end] >= 'a' && data[end] <= 'z') ||
+            (data[end] >= 'A' && data[end] <= 'Z')))
+      end++;
+    if (end > start && end < size && data[end] == '\0') {
+      printf("%s\n", data + start);
+      exit(0);
+    }
+  }
+  exit(1);
+}
+
+
+==============================================================================
+sandbox.c - file changes and function flow
+==============================================================================
+Task: sandbox <mask> <path> <command> [arguments...]
+
+The launcher forks. Only the child installs a policy using interpose(mask, path),
+then execs the requested command. The parent waits.
+
+A set mask bit restricts the syscall with that number: 1U << SYS_name.
+A clear bit adds no sandbox restriction. Selected open/exec calls have one
+exception: an exact match with the saved pathname is allowed. A saved "-" means
+there is no exception. Other selected syscalls return -1 without running their
+handlers. Despite the old comment in sandbox.c, path is an ALLOWED exception,
+not a pathname to block. These are string comparisons, not canonical-path checks.
+
+Example: SYS_open is 15, so 1 << 15 = 32768.
+  sandbox 32768 - cat README       -> cat cannot open README
+  sandbox 32768 README cat README  -> that exact pathname may be opened
+
+FILE-CHANGE ORDER
+
+1. kernel/proc.h - struct proc
+   Add sandbox_mask and sandbox_path[MAXPATH]. Store policy per process.
+
+2. kernel/proc.c - allocproc(), freeproc(), kfork()
+   allocproc(): initialize the mask to zero and the path to an empty string.
+   freeproc(): clear both fields before the process slot can be reused.
+   kfork(): copy the parent's mask and path into its child before it runs.
+   Without inheritance, a restricted program could fork an unrestricted child.
+
+3. kernel/syscall.h
+   Assign SYS_interpose a unique syscall number. This checkout uses 23.
+
+4. user/user.h
+   Declare int interpose(int, const char *); so user C code knows its type.
+
+5. user/usys.pl
+   Add entry("interpose"); to generate a user-side assembly wrapper.
+   Edit the generator; user/usys.S is generated again during the build.
+
+6. kernel/sysproc.c - sys_interpose()
+   Retrieve arguments, copy the pathname into kernel-owned process storage,
+   and save the mask. Reject replacement of an existing nonzero mask.
+   The syscall handler takes void because arguments come from saved registers.
+
+7. kernel/syscall.c - declaration, dispatch table, syscall()
+   Declare sys_interpose(), register [SYS_interpose] = sys_interpose,
+   and enforce the saved policy BEFORE invoking any selected syscall handler.
+   Store -1 in the saved return register and return when denying a call.
+
+8. user/sandbox.c and user/sbtest.c
+   Use the supplied launcher and tests below. interpose() must happen in the
+   child before exec(); otherwise the launcher parent is confined too.
+
+9. Makefile
+   Register _sandbox and _sbtest in the syscall lab's UPROGS list.
+   Existing rules generate/assemble the syscall wrappers and link user programs.
+
+10. Preserve policy across exec.
+    No sandbox-specific edit is required in kernel/exec.c. exec replaces the
+    program's user memory but keeps its struct proc, so its policy stays active.
+    kernel/trap.c and kernel/trampoline.S already carry syscall requests into
+    the kernel and return results; they need no sandbox-specific edits.
+
+
+==============================================================================
+kernel/proc.h - struct proc additions
+==============================================================================
+Add these fields inside the existing struct proc, before name[16]:
+
+  uint sandbox_mask;
+  char sandbox_path[MAXPATH];
+
+MAXPATH is supplied by kernel/param.h in the existing include context.
+
+
+==============================================================================
+kernel/proc.c - allocproc()
+==============================================================================
+Complete existing function with the sandbox initialization included.
+The task-specific lines initialize sandbox_mask and sandbox_path after state = USED.
+
+static struct proc *
+allocproc(void)
+{
+  struct proc *p;
+
+  for (p = proc; p < &proc[NPROC]; p++) {
+    acquire(&p->lock);
+    if (p->state == UNUSED) {
+      goto found;
+    } else {
+      release(&p->lock);
+    }
+  }
+  return 0;
+
+found:
+  p->pid = allocpid();
+  p->state = USED;
+  p->sandbox_mask = 0;
+  p->sandbox_path[0] = 0;
+
+  // Allocate a trapframe page.
+  if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // An empty user page table.
+  p->pagetable = proc_pagetable(p);
+  if (p->pagetable == 0) {
+    freeproc(p);
+    release(&p->lock);
+    return 0;
+  }
+
+  // Set up new context to start executing at forkret,
+  // which returns to user space.
+  memset(&p->context, 0, sizeof(p->context));
+  p->context.ra = (uint64)forkret;
+  p->context.sp = p->kstack + PGSIZE;
+
+  return p;
+}
+
+
+==============================================================================
+kernel/proc.c - freeproc()
+==============================================================================
+Complete existing function with the sandbox fields cleared before state = UNUSED.
+
+static void
+freeproc(struct proc *p)
+{
+  if (p->trapframe)
+    kfree((void *)p->trapframe);
+  p->trapframe = 0;
+  if (p->pagetable)
+    proc_freepagetable(p->pagetable, p->sz);
+  p->pagetable = 0;
+  p->sz = 0;
+  p->pid = 0;
+  p->name[0] = 0;
+  p->chan = 0;
+  p->killed = 0;
+  p->xstate = 0;
+  p->sandbox_mask = 0;
+  p->sandbox_path[0] = 0;
+  p->state = UNUSED;
+}
+
+
+==============================================================================
+kernel/proc.c - kfork()
+==============================================================================
+Complete existing function. The task-specific lines copy the mask and pathname
+after np->sz = p->sz. Copy the string contents, not a pointer into the parent.
+
+int
+kfork(void)
+{
+  int i, pid;
+  struct proc *np;
+  struct proc *p = myproc();
+
+  // Allocate process.
+  if ((np = allocproc()) == 0) {
+    return -1;
+  }
+
+  // Copy user memory from parent to child.
+  if (uvmcopy(p->pagetable, np->pagetable, p->sz) < 0) {
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
+  np->sz = p->sz;
+  np->sandbox_mask = p->sandbox_mask;
+  safestrcpy(np->sandbox_path, p->sandbox_path, sizeof(np->sandbox_path));
+
+  // copy saved user registers.
+  *(np->trapframe) = *(p->trapframe);
+
+  // Cause fork to return 0 in the child.
+  np->trapframe->a0 = 0;
+
+  // increment reference counts on open file descriptors.
+  for (i = 0; i < NOFILE; i++)
+    if (p->ofile[i])
+      np->ofile[i] = filedup(p->ofile[i]);
+  np->cwd = idup(p->cwd);
+
+  safestrcpy(np->name, p->name, sizeof(p->name));
+
+  pid = np->pid;
+
+  release(&np->lock);
+
+  acquire(&wait_lock);
+  np->parent = p;
+  release(&wait_lock);
+
+  acquire(&np->lock);
+  np->state = RUNNABLE;
+  release(&np->lock);
+
+  return pid;
+}
+
+
+==============================================================================
+kernel/syscall.h
+==============================================================================
+Complete syscall-number header from this checkout. The new entry is SYS_interpose.
+In a different xv6 version, choose a free number rather than assuming 23 is free.
+
+// System call numbers
+#define SYS_fork   1
+#define SYS_exit   2
+#define SYS_wait   3
+#define SYS_pipe   4
+#define SYS_read   5
+#define SYS_kill   6
+#define SYS_exec   7
+#define SYS_fstat  8
+#define SYS_chdir  9
+#define SYS_dup    10
+#define SYS_getpid 11
+#define SYS_sbrk   12
+#define SYS_pause  13
+#define SYS_uptime 14
+#define SYS_open   15
+#define SYS_write  16
+#define SYS_mknod  17
+#define SYS_unlink 18
+#define SYS_link   19
+#define SYS_mkdir  20
+#define SYS_close  21
+#define SYS_sync   22
+#define SYS_interpose 23
+
+
+==============================================================================
+user/user.h - interpose declaration
+==============================================================================
+Add this declaration beside the existing syscall declarations:
+
+int interpose(int, const char *);
+
+
+==============================================================================
+user/usys.pl - interpose wrapper entry
+==============================================================================
+Add this line beside the existing entry(...) calls:
+
+entry("interpose");
+
+The generator emits the following assembly into user/usys.S. This explains the
+flow; do not use manual edits to the generated file as your permanent change.
+The C caller puts mask in a0 and the pathname address in a1. The wrapper puts
+the syscall number in a7. ecall enters the kernel; the result comes back in a0.
+
+.global interpose
+interpose:
+ li a7, SYS_interpose
+ ecall
+ ret
+
+
+==============================================================================
+kernel/sysproc.c - sys_interpose()
+==============================================================================
+Add the complete function below to the existing file. This checkout already
+includes types.h, riscv.h, defs.h, param.h, memlayout.h, spinlock.h, proc.h, vm.h.
+
+myproc(): find the caller's process record.
+argint(0, &mask): read argument 0 as an integer.
+argstr(1, path, sizeof(path)): safely copy argument 1's string from user memory.
+safestrcpy(): retain the pathname in kernel memory after exec changes user memory.
+
+A nonzero saved mask prevents reinstallation. A zero mask does not mark a process
+as permanently configured in this implementation.
+
+uint64
+sys_interpose(void)
+{
+  struct proc *p = myproc();
+  int mask;
+  char path[MAXPATH];
+
+  // A confined process cannot remove or change its restrictions.
+  if (p->sandbox_mask != 0)
+    return -1;
+  argint(0, &mask);
+  if (argstr(1, path, sizeof(path)) < 0)
+    return -1;
+
+  p->sandbox_mask = (uint)mask;
+  safestrcpy(p->sandbox_path, path, sizeof(p->sandbox_path));
+  return 0;
+}
+
+
+==============================================================================
+kernel/syscall.c
+==============================================================================
+Complete file below, including existing argument helpers and syscall table.
+The sandbox changes are:
+  - extern uint64 sys_interpose(void);
+  - [SYS_interpose] = sys_interpose in syscalls[].
+  - The mask/path check in syscall(), before syscalls[num]() runs.
+
+syscall() reads the syscall number from trapframe->a7. It validates the number
+before testing the mask. num < 32 avoids shifting a 32-bit mask too far.
+For a selected syscall, deny unless it is open/exec AND its pathname exactly
+matches an ordinary saved path. Denial sets trapframe->a0 = -1 and returns;
+the underlying sys_open(), sys_exec(), etc. does not execute.
+
+argstr(0, ...) is used here because pathname is argument 0 to open()/exec().
+argstr(1, ...) in sys_interpose() is different: pathname is its argument 1.
+
+#include "types.h"
+#include "param.h"
+#include "memlayout.h"
+#include "riscv.h"
+#include "spinlock.h"
+#include "proc.h"
+#include "syscall.h"
+#include "defs.h"
+
+// Fetch the uint64 at addr from the current process.
+int
+fetchaddr(uint64 addr, uint64 *ip)
+{
+  struct proc *p = myproc();
+  if (addr >= p->sz ||
+      addr + sizeof(uint64) > p->sz) // both tests needed, in case of overflow
+    return -1;
+  if (copyin(p->pagetable, p->sz, (char *)ip, addr, sizeof(*ip)) != 0)
+    return -1;
+  return 0;
+}
+
+// Fetch the nul-terminated string at addr from the current process.
+// Returns length of string, not including nul, or -1 for error.
+int
+fetchstr(uint64 addr, char *buf, int max)
+{
+  struct proc *p = myproc();
+  if (copyinstr(p->pagetable, p->sz, buf, addr, max) < 0)
+    return -1;
+  return strlen(buf);
+}
+
+static uint64
+argraw(int n)
+{
+  struct proc *p = myproc();
+  switch (n) {
+  case 0:
+    return p->trapframe->a0;
+  case 1:
+    return p->trapframe->a1;
+  case 2:
+    return p->trapframe->a2;
+  case 3:
+    return p->trapframe->a3;
+  case 4:
+    return p->trapframe->a4;
+  case 5:
+    return p->trapframe->a5;
+  }
+  panic("argraw");
+  return -1;
+}
+
+// Fetch the nth 32-bit system call argument.
+void
+argint(int n, int *ip)
+{
+  *ip = argraw(n);
+}
+
+// Retrieve an argument as a pointer.
+// Doesn't check for legality, since
+// copyin/copyout will do that.
+void
+argaddr(int n, uint64 *ip)
+{
+  *ip = argraw(n);
+}
+
+// Fetch the nth word-sized system call argument as a null-terminated string.
+// Copies into buf, at most max.
+// Returns string length if OK (not including nul), -1 if error.
+int
+argstr(int n, char *buf, int max)
+{
+  uint64 addr;
+  argaddr(n, &addr);
+  return fetchstr(addr, buf, max);
+}
+
+// Prototypes for the functions that handle system calls.
+extern uint64 sys_fork(void);
+extern uint64 sys_exit(void);
+extern uint64 sys_wait(void);
+extern uint64 sys_pipe(void);
+extern uint64 sys_read(void);
+extern uint64 sys_kill(void);
+extern uint64 sys_exec(void);
+extern uint64 sys_fstat(void);
+extern uint64 sys_chdir(void);
+extern uint64 sys_dup(void);
+extern uint64 sys_getpid(void);
+extern uint64 sys_sbrk(void);
+extern uint64 sys_pause(void);
+extern uint64 sys_uptime(void);
+extern uint64 sys_open(void);
+extern uint64 sys_write(void);
+extern uint64 sys_mknod(void);
+extern uint64 sys_unlink(void);
+extern uint64 sys_link(void);
+extern uint64 sys_mkdir(void);
+extern uint64 sys_close(void);
+extern uint64 sys_sync(void);
+extern uint64 sys_interpose(void);
+
+// An array mapping syscall numbers from syscall.h
+// to the function that handles the system call.
+static uint64 (*syscalls[])(void) = {
+  // clang-format off
+  [SYS_fork]    = sys_fork,
+  [SYS_exit]    = sys_exit,
+  [SYS_wait]    = sys_wait,
+  [SYS_pipe]    = sys_pipe,
+  [SYS_read]    = sys_read,
+  [SYS_kill]    = sys_kill,
+  [SYS_exec]    = sys_exec,
+  [SYS_fstat]   = sys_fstat,
+  [SYS_chdir]   = sys_chdir,
+  [SYS_dup]     = sys_dup,
+  [SYS_getpid]  = sys_getpid,
+  [SYS_sbrk]    = sys_sbrk,
+  [SYS_pause]   = sys_pause,
+  [SYS_uptime]  = sys_uptime,
+  [SYS_open]    = sys_open,
+  [SYS_write]   = sys_write,
+  [SYS_mknod]   = sys_mknod,
+  [SYS_unlink]  = sys_unlink,
+  [SYS_link]    = sys_link,
+  [SYS_mkdir]   = sys_mkdir,
+  [SYS_close]   = sys_close,
+  [SYS_sync]    = sys_sync,
+  [SYS_interpose] = sys_interpose,
+  // clang-format on
+};
+
+void
+syscall(void)
+{
+  int num;
+  struct proc *p = myproc();
+
+  num = p->trapframe->a7;
+  if (num > 0 && num < NELEM(syscalls) && syscalls[num]) {
+    if (num < 32 && (p->sandbox_mask & (1U << num))) {
+      char path[MAXPATH];
+      if ((num != SYS_open && num != SYS_exec) ||
+          strncmp(p->sandbox_path, "-", MAXPATH) == 0 ||
+          argstr(0, path, sizeof(path)) < 0 ||
+          strncmp(path, p->sandbox_path, MAXPATH) != 0) {
+        p->trapframe->a0 = -1;
+        return;
+      }
+    }
+    // Use num to lookup the system call function for num, call it,
+    // and store its return value in p->trapframe->a0
+    p->trapframe->a0 = syscalls[num]();
+  } else {
+    printk("%d %s: unknown sys call %d\n", p->pid, p->name, num);
+    p->trapframe->a0 = -1;
+  }
+}
+
+
+==============================================================================
+sandbox.c
+==============================================================================
+File: user/sandbox.c - complete existing launcher.
+The old path comment in this file is misleading; use the allowed-exception rule
+explained above. The supplied launcher only checks the mask's first character;
+it is reproduced as it exists, rather than presented as strict numeric parsing.
+
+Example argument conversion:
+  argv  = {"sandbox", "32768", "-", "cat", "README", 0}
+  nargv = {"cat", "README", 0}
+
+fork() returns 0 in the child and a positive child PID in the parent.
+The child installs policy then execs; the parent calls wait(0).
+Successful exec() does not return to the launcher's next statement.
+
+#include "kernel/param.h"
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "kernel/syscall.h"
+#include "user/user.h"
+
+void
+usage(char *s)
+{
+  fprintf(2, "Usage: %s <mask> <path> <command>\n", s);
+  exit(1);
+}
+
+// Sandbox a command by disallowing system calls in mask and
+// system calls that are using path
+int
+main(int argc, char *argv[])
+{
+  int i;
+  int n = 2;
+  int mask = 1;
+  char *nargv[MAXARG];
+
+  if (argc < 4) {
+    usage(argv[0]);
+  }
+
+  if (argv[mask][0] < '0' || argv[mask][0] > '9') {
+    usage(argv[0]);
+  }
+
+  n += 1; // skip path
+
+  // strip off the first n arguments to sandbox
+  for (i = n; i < argc && i < MAXARG; i++) {
+    nargv[i - n] = argv[i];
+  }
+  nargv[argc - n] = 0;
+
+  int pid = fork();
+  if (pid < 0) {
+    printf("%s: exec fork failed\n", argv[0]);
+    exit(1);
+  }
+  if (pid == 0) {
+    if (interpose(atoi(argv[mask]), argv[mask + 1]) < 0) {
+      printf("%s: interpose failed", argv[0]);
+      exit(1);
+    }
+    exec(nargv[0], nargv);
+    printf("%s: exec %s failed\n", argv[0], nargv[0]);
+    exit(1);
+  } else {
+    wait(0);
+  }
+
+  return 0;
+}
+
+
+==============================================================================
+sbtest.c
+==============================================================================
+File: user/sbtest.c - complete existing sandbox test helper.
+
+#include "kernel/types.h"
+#include "kernel/stat.h"
+#include "kernel/fcntl.h"
+#include "user/user.h"
+
+static void
+report(char *what, int fd)
+{
+  if (fd < 0) {
+    printf("sbtest: forkpath child %s denied\n", what);
+  } else {
+    printf("sbtest: forkpath child %s ok\n", what);
+    close(fd);
+  }
+}
+
+int
+main(int argc, char *argv[])
+{
+  int r;
+
+  if (argc != 2) {
+    fprintf(2, "Usage: sbtest getpid|fork|escape|forkpath\n");
+    exit(1);
+  }
+
+  // getpid and fork take no argument, so a kernel that blocks a call by
+  // corrupting its arguments cannot make them fail.
+  if (strcmp(argv[1], "getpid") == 0) {
+    printf("sbtest: getpid ret %d\n", getpid());
+  } else if (strcmp(argv[1], "fork") == 0) {
+    r = fork();
+    if (r == 0) {
+      printf("sbtest: CHILD RAN\n");
+      exit(0);
+    }
+    if (r > 0)
+      wait(0);
+    printf("sbtest: fork ret %d\n", r);
+  } else if (strcmp(argv[1], "escape") == 0) {
+    interpose(0, 0);
+    interpose(0, "README");
+    r = open("README", O_RDONLY);
+    if (r < 0) {
+      printf("sbtest: escape confined\n");
+    } else {
+      printf("sbtest: escape ESCAPED\n");
+      close(r);
+    }
+  } else if (strcmp(argv[1], "forkpath") == 0) {
+    r = fork();
+    if (r == 0) {
+      report("README", open("README", O_RDONLY));
+      report("exec.sh", open("exec.sh", O_RDONLY));
+      exit(0);
+    }
+    if (r > 0)
+      wait(0);
+  } else {
+    fprintf(2, "sbtest: unknown test %s\n", argv[1]);
+    exit(1);
+  }
+
+  printf("sbtest: alive\n");
+  exit(0);
+}
+
+
+==============================================================================
+sandbox.c - runtime function flow
+==============================================================================
+EXAMPLE: sandbox 32768 - cat README
+
+1. The shell launches sandbox, whose main() prepares nargv and calls fork().
+   Kernel path: syscall() -> sys_fork() -> kfork() -> allocproc().
+   allocproc() initializes the child; kfork() copies the parent's policy.
+   With an unrestricted launcher, both processes initially have mask 0.
+
+2. The sandbox parent waits. The child calls interpose(32768, "-").
+   user/sandbox.c: main(), child branch
+       -> user/usys.S: interpose wrapper
+          a0 = 32768, a1 = address of "-", a7 = SYS_interpose (23)
+       -> ecall
+       -> existing trampoline/trap entry
+       -> kernel/trap.c: usertrap()
+       -> kernel/syscall.c: syscall()
+       -> syscalls[23]() = sys_interpose()
+       -> kernel/sysproc.c: sys_interpose()
+          myproc(), argint(), argstr(), safestrcpy()
+          save mask 32768 and path "-"; return 0
+       -> syscall() saves 0 in trapframe->a0
+       -> existing kernel return path restores user registers
+       -> interpose wrapper returns 0 to sandbox's child.
+
+3. The child calls exec("cat", nargv).
+   syscall() checks number 7. Bit 7 is clear in 32768, so exec is permitted.
+   sys_exec() -> kexec() replaces the child's user program with cat.
+   The PID/process record stays the same, so mask 32768 and path "-" survive.
+
+4. cat calls open("README", O_RDONLY).
+   The open wrapper sends SYS_open (15).
+   usertrap() -> syscall(): mask bit 15 is set.
+   Saved path "-" means no exception, so syscall() writes -1 to a0 and returns.
+   sys_open() is NOT called. cat receives fd == -1 and prints its open error.
+
+5. cat exits. The parent's wait(0) completes, the sandbox parent finishes,
+   and the shell prompt returns. Process cleanup eventually uses freeproc(),
+   which clears the sandbox fields before the slot is reused.
+
+FUNCTIONS TO REMEMBER
+  main() in sandbox.c     prepare args -> fork -> child interpose -> child exec
+  allocproc()             initialize policy
+  kfork()                 inherit policy
+  freeproc()              clear policy
+  interpose()             generated user wrapper, enters kernel with ecall
+  usertrap()              existing trap handler, calls syscall()
+  syscall()               dispatch syscall; enforce restrictions before handler
+  sys_interpose()         fetch arguments and install policy
+  myproc()                obtain current process
+  argint()/argstr()       retrieve syscall arguments
+  safestrcpy()            copy the policy string into the process record
+  sys_exec()/kexec()      replace user program, preserve process policy
+
+TEST COMMANDS (inside the xv6 shell)
+  sandbox 32768 - cat README
+    Expect cat's cannot-open error.
+  sandbox 32768 README cat README
+    Expect README contents, assuming the file exists.
+  sandbox 2 - sbtest fork
+    SYS_fork = 1, mask = 2. Expect fork ret -1, no CHILD RAN, then alive.
+  sandbox 2048 - sbtest getpid
+    SYS_getpid = 11, mask = 2048. Expect getpid ret -1, then alive.
+  sandbox 32768 - sbtest escape
+    Attempts to reinstall a zero mask must fail; expect escape confined.
+  sandbox 32768 README sbtest forkpath
+    The test child inherits policy. Expect README ok and exec.sh denied.
+
+The launcher's first fork happens BEFORE it installs the policy. Therefore a
+policy denying fork still allows the launcher to create its initial child.
+
+
+==============================================================================
+Makefile - task registration and build commands
+==============================================================================
+These entries belong to the existing xv6 Makefile. They are not a replacement
+for it. This tree selects tasks using LAB=util or LAB=syscall. Keep the existing
+compiler, linker, wrapper-generation, and fs.img rules.
+
+ifeq ($(LAB),util)
+UEXTRA += user/findtest.sh
+UEXTRA += user/sixfive.txt
+UPROGS += $U/_memdump $U/_sleep $U/_sixfive $U/_find
+endif
+
+ifeq ($(LAB),syscall)
+UPROGS += $U/_sandbox $U/_sbtest $U/_secret $U/_attack
+UEXTRA += user/exec.sh
+endif
+
+conf/lab.mk currently contains:
+  LAB=syscall
+
+Ubuntu/WSL terminal, from the original xv6 checkout:
+  cd /home/qasim/os-assignment2/xv6-labs-2026
+
+Utilities:
+  make clean
+  make LAB=util qemu
+
+Sandbox and secret/attack:
+  make clean
+  make LAB=syscall qemu
+
+Quit QEMU: press Ctrl+A, release, then press X.
+
+Checkers supplied by the assignment:
+  make LAB=util grade
+  make LAB=syscall grade
+  make LAB=syscall GRADEFLAGS=sandbox grade
+  make LAB=syscall GRADEFLAGS=attack grade
+
+If switching lab modes, clean before rebuilding. The code collection itself is
+a study file, not a build input. Copy each listing only to its named source file.
+
