@@ -1,32 +1,32 @@
 #include "kernel/types.h"
+#include "kernel/fcntl.h"
 #include "user/user.h"
+#include "kernel/riscv.h"
+
+#define DATASIZE (9 * 4096)
 
 int
 main(int argc, char *argv[])
 {
-  int size = 32 * 4096;
-  char *data = sbrk(size);
-  if (data == SBRK_ERROR) {
-    fprintf(2, "attack: allocation failed\n");
+  if (argc != 2) {
+    printf("Usage: secret the-secret\n");
     exit(1);
   }
 
-  char *marker = "Here it is: ";
-  int length = strlen(marker);
-  for (int i = 0; i + length < size; i++) {
-    if (memcmp(data + i, marker, length) != 0)
-      continue;
-    int start = i + length;
-    int end = start;
-    while (end < size &&
-           ((data[end] >= '0' && data[end] <= '9') ||
-            (data[end] >= 'a' && data[end] <= 'z') ||
-            (data[end] >= 'A' && data[end] <= 'Z')))
-      end++;
-    if (end > start && end < size && data[end] == '\0') {
-      printf("%s\n", data + start);
-      exit(0);
-    }
-  }
-  exit(1);
+  char *data = sbrk(DATASIZE);
+
+  // avoid putting the secret near the very start of a page.
+  unsigned long align = ((unsigned long) data) % 4096;
+  if(align != 0)
+    data += (4096 - align);
+
+  // but put it at a random-ish offset.
+  if(strlen(argv[1]) > 0)
+    data += 32 + (unsigned int)(argv[1][0] & 0xff);
+
+#define MSG "Here it is: "
+  strcpy(data, MSG);
+  strcpy(data + strlen(MSG), argv[1]);
+
+  exit(0);
 }
